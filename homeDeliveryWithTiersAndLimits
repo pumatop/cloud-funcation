@@ -1,0 +1,90 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+
+if (admin.apps.length === 0) {
+    admin.initializeApp();
+}
+
+/**
+ * دالة طلب التوصيل (وصلي للبيت) بنظام الشرائح:
+ * 1. التحقق من الحدود (مثلاً من 50 إلى 10,000 دينار).
+ * 2. حساب رسوم الخدمة بناءً على مبلغ العملية (شرائح).
+ * 3. خصم الإجمالي (المبلغ + الرسوم) وتوجيه الطلب للمندوب.
+ */
+exports.homeDeliveryWithTiersAndLimits = functions.https.onCall(async (data, context) => {
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const uid = context.auth.uid;
+    const { amount, receiverName, receiverPhone, representativeId, currencyType } = data;
+    const deliveryAmount = parseFloat(amount);
+    const db = admin.database();
+
+    // --- 1. إعدادات الحدود (Limits) ---
+    const MIN_LIMIT = currencyType === 'LYD' ? 50 : 500;
+    const MAX_LIMIT = currencyType === 'LYD' ? 10000 : 100000;
+
+    if (deliveryAmount < MIN_LIMIT || deliveryAmount > MAX_LIMIT) {
+        throw new functions.https.HttpsError('out-of-range', `المبلغ خارج الحدود المسموحة (${MIN_LIMIT} - ${MAX_LIMIT})`);
+    }
+
+    // --- 2. منطق حساب رسوم الخدمة (شرائح - Tiers) ---
+    let serviceFee = 0;
+    if (currencyType === 'LYD') {
+        if (deliveryAmount <= 500) serviceFee = 10;        // شريحة 1
+        else if (deliveryAmount <= 2000) serviceFee = 25;  // شريحة 2
+        else serviceFee = 50;                             // شريحة 3
+    } else {
+        // شرائح الجنيه المصري
+        if (deliveryAmount <= 5000) serviceFee = 100;
+        else if (deliveryAmount <= 20000) serviceFee = 250;
+        else serviceFee = 500;
+    }
+
+    const totalDeduction = deliveryAmount + serviceFee;
+    const walletField = currencyType === 'LYD' ? 'lyd_balance' : 'egp_balance';
+
+    try {
+        // 3. الخصم من الرصيد
+        const walletRef = db.ref(`users/${uid}/wallets/${walletField}`);
+        const result = await walletRef.transaction((current) => {
+            if (current === null) return 0;
+            if (current < totalDeduction) return; 
+            return current - totalDeduction;
+        });
+
+        if (!result.committed) {
+            throw new functions.https.HttpsError('failed-precondition', 'رصيدك لا يكفي للمبلغ ورسوم الخدمة');
+        }
+
+        // 4. تسجيل الرسوم كإيراد للمنصة
+        await db.ref(`metadata/revenue/delivery_service_fees`).transaction(c => (c || 0) + serviceFee);
+
+        // 5. إنشاء الطلب للمندوب
+        const requestId = db.ref('admin_tasks/delivery_orders').push().key;
+        const orderData = {
+            requestId,
+            senderUid: uid,
+            receiverName,
+            receiverPhone,
+            amount: deliveryAmount,
+            fee: serviceFee,
+            currency: currencyType,
+            representativeId,
+            status: 'PENDING',
+            timestamp: admin.database.ServerValue.TIMESTAMP
+        };
+
+        await db.ref(`admin_tasks/delivery_orders/${requestId}`).set(orderData);
+
+        return { 
+            success: true, 
+            calculatedFee: serviceFee,
+            message: `تم خصم ${totalDeduction} (شاملاً الرسوم: ${serviceFee}) وتنبيه المندوب.` 
+        };
+
+    } catch (error) {
+        throw new functions.https.HttpsError('internal', 'خطأ في معالجة طلب الشرائح');
+    }
+});
