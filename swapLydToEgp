@@ -1,0 +1,78 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+
+if (admin.apps.length === 0) {
+    admin.initializeApp();
+}
+
+/**
+ * دالة التحويل بين العملات لنفس المستخدم:
+ * 1. تجلب سعر الصرف الحالي من الإعدادات.
+ * 2. تتأكد من وجود رصيد كافٍ بالدينار (LYD).
+ * 3. تخصم من الدينار وتضيف للجنيه (EGP) بناءً على السعر.
+ */
+exports.swapLydToEgp = functions.https.onCall(async (data, context) => {
+    // التأكد من تسجيل الدخول
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const uid = context.auth.uid;
+    const lydToConvert = parseFloat(data.amount); // المبلغ بالدينار المراد تحويله
+
+    if (lydToConvert <= 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'المبلغ يجب أن يكون أكبر من صفر');
+    }
+
+    const db = admin.database();
+
+    try {
+        // 1. جلب سعر الصرف الحالي (مثلاً: 1 دينار = 10 جنيه)
+        const rateSnapshot = await db.ref('settings/currency/rate').get();
+        const exchangeRate = rateSnapshot.val() || 1; // القيمة الافتراضية 1 إذا لم يوجد سعر
+
+        const egpToAdd = lydToConvert * exchangeRate;
+
+        // 2. تحديث المحافظ داخل حساب المستخدم
+        const userWalletsRef = db.ref(`users/${uid}/wallets`);
+        
+        const result = await userWalletsRef.transaction((wallets) => {
+            if (wallets === null) return wallets;
+
+            // التأكد من كفاية الرصيد الليبي
+            if (wallets.lyd_balance < lydToConvert) {
+                return; // سيفشل الـ Transaction هنا
+            }
+
+            // تنفيذ التبديل
+            wallets.lyd_balance -= lydToConvert;
+            wallets.egp_balance = (wallets.egp_balance || 0) + egpToAdd;
+
+            return wallets;
+        });
+
+        if (!result.committed) {
+            throw new functions.https.HttpsError('failed-precondition', 'عذراً، رصيدك بالدينار غير كافٍ');
+        }
+
+        // 3. تسجيل العملية في السجلات
+        await db.ref(`users/${uid}/history`).push({
+            type: 'CURRENCY_SWAP',
+            from: 'LYD',
+            to: 'EGP',
+            amount_from: lydToConvert,
+            amount_to: egpToAdd,
+            rate_used: exchangeRate,
+            timestamp: admin.database.ServerValue.TIMESTAMP
+        });
+
+        return { 
+            success: true, 
+            message: `تم تحويل ${lydToConvert} دينار إلى ${egpToAdd} جنيه بنجاح` 
+        };
+
+    } catch (error) {
+        console.error("Swap Error:", error);
+        throw new functions.https.HttpsError('internal', error.message);
+    }
+});
