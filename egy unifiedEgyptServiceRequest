@@ -1,0 +1,122 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+
+if (admin.apps.length === 0) {
+    admin.initializeApp();
+}
+
+/**
+ * الدالة الشاملة للخدمات المصرية (جنيه مصري):
+ * - المحافظ و InstaPay: تتطلب رقم الهاتف فقط.
+ * - وصلي للبيت: تتطلب اسم المستلم، رقم الهاتف، واختيار المندوب.
+ */
+exports.unifiedEgyptServiceRequest = functions.https.onCall(async (data, context) => {
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const uid = context.auth.uid;
+    const { 
+        serviceType,    // 'E_WALLET', 'INSTAPAY', 'HOME_DELIVERY'
+        amount, 
+        phoneNumber,    
+        receiverName,   // مطلوب فقط في HOME_DELIVERY
+        representativeId // مطلوب فقط في HOME_DELIVERY
+    } = data;
+
+    const requestAmount = parseFloat(amount);
+    const db = admin.database();
+    
+    // --- 1. التحقق من البيانات الإلزامية بناءً على نوع الخدمة ---
+    if (serviceType === 'HOME_DELIVERY') {
+        if (!receiverName || !representativeId || !phoneNumber) {
+            throw new functions.https.HttpsError('invalid-argument', 'لخدمة وصلي للبيت: يجب إدخال اسم المستلم، رقم هاتفه، واختيار المندوب');
+        }
+    } else {
+        if (!phoneNumber) {
+            throw new functions.https.HttpsError('invalid-argument', 'يجب إدخال رقم الهاتف لإتمام العملية');
+        }
+    }
+
+    // --- 2. إعدادات الحدود والرسوم بناءً على النوع ---
+    let config = { min: 0, max: 0, fee: 0, revenuePath: '' };
+
+    switch (serviceType) {
+        case 'E_WALLET':
+            config.min = 100; config.max = 50000; config.fee = 5.0;
+            config.revenuePath = 'metadata/revenue/egypt_wallet_fees';
+            break;
+            
+        case 'INSTAPAY':
+            config.min = 500; config.max = 100000; config.fee = 10.0;
+            config.revenuePath = 'metadata/revenue/instapay_fees';
+            break;
+
+        case 'HOME_DELIVERY':
+            config.min = 500; config.max = 50000;
+            // نظام الشرائح
+            if (requestAmount <= 5000) config.fee = 100;
+            else if (requestAmount <= 20000) config.fee = 250;
+            else config.fee = 500;
+            config.revenuePath = 'metadata/revenue/home_delivery_fees';
+            break;
+
+        default:
+            throw new functions.https.HttpsError('invalid-argument', 'نوع الخدمة غير مدعوم');
+    }
+
+    // --- 3. التحقق من الحدود والخصم من الرصيد ---
+    if (requestAmount < config.min || requestAmount > config.max) {
+        throw new functions.https.HttpsError('out-of-range', `المبلغ يجب أن يكون بين ${config.min} و ${config.max} جنيه`);
+    }
+
+    const totalDeduction = requestAmount + config.fee;
+
+    try {
+        const walletRef = db.ref(`users/${uid}/wallets/egp_balance`);
+        const result = await walletRef.transaction((current) => {
+            if (current === null) return 0;
+            if (current < totalDeduction) return; 
+            return current - totalDeduction;
+        });
+
+        if (!result.committed) {
+            throw new functions.https.HttpsError('failed-precondition', 'رصيدك لا يكفي للمبلغ والرسوم');
+        }
+
+        // --- 4. تسجيل الإيرادات وإنشاء الطلب ---
+        await db.ref(config.revenuePath).transaction(c => (c || 0) + config.fee);
+
+        const requestId = db.ref('admin_tasks/pending_orders').push().key;
+        const orderData = {
+            requestId,
+            serviceType,
+            senderUid: uid,
+            amount: requestAmount,
+            fee: config.fee,
+            phoneNumber,
+            receiverName: receiverName || null, // سيكون null في المحافظ وانستا باي
+            representativeId: representativeId || null, // سيكون null في المحافظ وانستا باي
+            status: 'PENDING',
+            timestamp: admin.database.ServerValue.TIMESTAMP
+        };
+
+        await db.ref(`admin_tasks/pending_orders/${requestId}`).set(orderData);
+        await db.ref(`users/${uid}/history/${requestId}`).set(orderData);
+
+        // --- 5. الإشعارات ---
+        // المندوب يستلم فقط طلبات التوصيل، الأدمن يستلم البقية
+        const targetTopic = (serviceType === 'HOME_DELIVERY') ? representativeId : 'egypt_admins';
+        await admin.messaging().sendToTopic(targetTopic, {
+            notification: {
+                title: `طلب ${serviceType} جديد`,
+                body: `المبلغ: ${requestAmount} ج.م`
+            }
+        });
+
+        return { success: true, requestId, fee: config.fee };
+
+    } catch (error) {
+        throw new functions.https.HttpsError('internal', error.message);
+    }
+});
