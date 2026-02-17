@@ -1,0 +1,41 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+
+if (admin.apps.length === 0) {
+    admin.initializeApp();
+}
+
+/**
+ * دالة حذف الحساب:
+ * 1. تحذف المستخدم من نظام Firebase Authentication.
+ * 2. تحذف كافة بياناته من Realtime Database.
+ * 3. تنقص عداد المستخدمين الإجمالي (تراكمي) بمقدار 1.
+ */
+exports.deleteUserAccount = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من أن الطلب آتٍ من مسؤول (Admin)
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول كمسؤول');
+    }
+
+    const uidToDelete = data.uid; // الـ UID الخاص بالمستخدم المراد حذفه
+    const db = admin.database();
+
+    try {
+        // 2. حذف المستخدم من نظام Auth (يمنعه من تسجيل الدخول فوراً)
+        await admin.auth().deleteUser(uidToDelete);
+
+        // 3. حذف بيانات المستخدم من قاعدة البيانات
+        await db.ref(`users/${uidToDelete}`).remove();
+
+        // 4. تحديث العداد التراكمي للمستخدمين (نقصان 1)
+        await db.ref('metadata/total_users').transaction((currentCount) => {
+            return (currentCount || 0) - 1;
+        });
+
+        return { success: true, message: `تم حذف المستخدم ${uidToDelete} بنجاح وتحديث الإحصائيات` };
+
+    } catch (error) {
+        console.error("Error deleting user:", error);
+        throw new functions.https.HttpsError('internal', 'حدث خطأ أثناء عملية الحذف: ' + error.message);
+    }
+});
