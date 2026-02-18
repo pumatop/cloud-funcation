@@ -1,0 +1,97 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+
+/**
+ * دالة مساعدة لتشفير الـ PIN
+ */
+function hashData(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * دالة تغيير رمز الـ PIN مع شروط خاصة للاستعادة عند النسيان
+ * اسم الدالة: updateUserPIN
+ */
+exports.updateUserPIN = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من تسجيل الدخول
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const uid = context.auth.uid;
+    const { oldPin, newPin, resetCode, method } = data; // method: 'OLD_PIN' أو 'RESET_CODE'
+    const db = admin.database();
+
+    try {
+        const userRef = db.ref(`users/${uid}`);
+        const snapshot = await userRef.once('value');
+        const userData = snapshot.val();
+
+        // --- الحالة الأولى: التغيير باستخدام الرمز القديم (بدون قيود زمنية) ---
+        if (method === 'OLD_PIN') {
+            if (hashData(oldPin) !== userData.profile.pin) {
+                throw new functions.https.HttpsError('permission-denied', 'رمز PIN القديم غير صحيح');
+            }
+        } 
+        
+        // --- الحالة الثانية: التغيير باستخدام كود التحقق (عند النسيان - مع القيود) ---
+        else if (method === 'RESET_CODE') {
+            // التحقق من شرط الـ 24 ساعة من تغيير كلمة المرور
+            const lastPassChange = userData.profile.lastPasswordChange || 0;
+            const currentTime = Date.now();
+            const twentyFourHours = 24 * 60 * 60 * 1000;
+
+            if (currentTime - lastPassChange < twentyFourHours) {
+                // تجميد الحساب فوراً لمدة 24 ساعة بسبب مخالفة الشرط الأمني عند النسيان
+                await userRef.child('profile').update({
+                    isFrozen: true,
+                    freezeReason: "محاولة استعادة PIN قبل مرور 24 ساعة على تغيير كلمة المرور",
+                    freezeUntil: currentTime + twentyFourHours
+                });
+                
+                // تسجيل الخروج من كافة الأجهزة
+                await admin.auth().revokeRefreshTokens(uid);
+
+                throw new functions.https.HttpsError('permission-denied', 'أمنياً: لا يمكن استعادة PIN المنسي إلا بعد 24 ساعة من تغيير كلمة المرور. تم تجميد حسابك مؤقتاً.');
+            }
+
+            // التحقق من صحة كود التحقق
+            const tempCodeSnap = await db.ref(`temp_codes/${uid}/pin_reset`).once('value');
+            if (!tempCodeSnap.exists() || tempCodeSnap.val() !== resetCode) {
+                throw new functions.https.HttpsError('permission-denied', 'كود التحقق غير صحيح أو منتهي الصلاحية');
+            }
+            // حذف الكود بعد الاستخدام
+            await db.ref(`temp_codes/${uid}/pin_reset`).remove();
+        } else {
+            throw new functions.https.HttpsError('invalid-argument', 'يجب تحديد طريقة التغيير');
+        }
+
+        // 3. التحديث (التشفير وحفظ وقت التغيير)
+        const hashedPassword = hashData(newPin);
+        await userRef.child('profile').update({
+            pin: hashedPassword,
+            lastPinChange: admin.database.ServerValue.TIMESTAMP
+        });
+
+        // 4. تسجيل الخروج من كافة الأجهزة لضمان الأمان
+        await admin.auth().revokeRefreshTokens(uid);
+
+        // 5. إرسال إشعار للمستخدم
+        const fcmTokenSnap = await db.ref(`users/${uid}/fcmToken`).once('value');
+        if (fcmTokenSnap.exists()) {
+            const payload = {
+                notification: {
+                    title: "تحديث أمني 🛡️",
+                    body: "تم تغيير رمز PIN الخاص بك بنجاح. تم تسجيل خروج الأجهزة الأخرى."
+                }
+            };
+            await admin.messaging().sendToDevice(fcmTokenSnap.val(), payload);
+        }
+
+        return { success: true, message: "تم تحديث رمز PIN بنجاح" };
+
+    } catch (error) {
+        throw new functions.https.HttpsError('internal', error.message);
+    }
+});
