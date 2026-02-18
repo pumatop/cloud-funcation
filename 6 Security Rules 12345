@@ -1,0 +1,39 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        // يسمح للمستخدم بقراءة بياناته فقط، ولا يسمح له بالكتابة المباشرة
+        // الكتابة يجب أن تتم فقط عبر الدوال (Cloud Functions) لضمان التشفير والتحقق
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": false, 
+        
+        "profile": {
+          // حماية خاصة للحقول الحساسة
+          "isFrozen": { ".validate": false }, // لا يمكن للمستخدم تغيير حالة التجميد
+          "verificationStatus": { ".validate": false }, // لا يمكن للمستخدم توثيق نفسه
+          "pin": { ".validate": "newData.isString() && newData.val().length > 0" }
+        },
+        "wallets": {
+          // الأرصدة للقراءة فقط من جهة التطبيق، التعديل حصراً عبر السيرفر
+          ".read": "auth != null && auth.uid == $uid",
+          ".write": false
+        }
+      }
+    },
+    "registered_phones": {
+      // منع أي شخص من قراءة قائمة الهواتف المسجلة بالكامل
+      ".read": false,
+      ".write": false
+    },
+    "settings": {
+      // سعر الصرف متاح للقراءة للجميع، ولكن التعديل للأدمن فقط (عبر الدالة)
+      ".read": "auth != null",
+      ".write": false
+    },
+    "temp_codes": {
+      // أكواد التحقق لا يمكن قراءتها من التطبيق أبداً (تتم المقارنة في السيرفر فقط)
+      ".read": false,
+      ".write": false
+    }
+  }
+}
