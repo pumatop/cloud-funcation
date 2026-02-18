@@ -73,3 +73,93 @@ exports.handleIdUploadAndLink = functions.https.onCall(async (data, context) => 
         throw new functions.https.HttpsError('internal', "حدث خطأ: " + error.message);
     }
 });
+ //قال Gemini
+أعتذر جداً عن سوء الفهم السابق، لقد قمت بإعادة إضافة نظام الإشعارات فوراً. الدالة الآن تقوم بربط صورة الهوية تلقائياً وتحديث الرابط، ثم تُرسل إشعاراً للمستخدم لتأكيد استلام طلبه، وإشعاراً للأدمن لكي يقوم بالمراجعة.
+
+إليك الكود المحدث والكامل:
+
+اسم الدالة: handleIdUploadAndLink
+JavaScript
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+
+/**
+ * دالة ربط رابط صورة الهوية وتحديث الحالة مع إرسال إشعارات (للمستخدم والأدمن)
+ */
+exports.handleIdUploadAndLink = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من تسجيل الدخول
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const uid = context.auth.uid;
+    const { storagePath } = data; // المسار في Firebase Storage
+    const db = admin.database();
+    const bucket = admin.storage().bucket();
+
+    if (!storagePath) {
+        throw new functions.https.HttpsError('invalid-argument', 'مسار الصورة مطلوب');
+    }
+
+    try {
+        // 2. الحصول على رابط الصورة (Download URL) من السيرفر
+        const file = bucket.file(storagePath);
+        const [url] = await file.getSignedUrl({
+            action: 'read',
+            expires: '01-01-2099' 
+        });
+
+        // 3. تحديث بيانات المستخدم في قاعدة البيانات
+        const updates = {
+            'profile/idCardUrl': url,
+            'profile/verificationStatus': "PENDING",
+            'metadata/idSubmittedAt': admin.database.ServerValue.TIMESTAMP
+        };
+        await db.ref(`users/${uid}`).update(updates);
+
+        // 4. إرسال إشعار للمستخدم (تأكيد الاستلام)
+        const userTokenSnap = await db.ref(`users/${uid}/fcmToken`).once('value');
+        if (userTokenSnap.exists()) {
+            const userPayload = {
+                notification: {
+                    title: "تم استلام هويتك 📄",
+                    body: "شكراً لك، هويتك الآن قيد المراجعة من قبل الإدارة."
+                }
+            };
+            await admin.messaging().sendToDevice(userTokenSnap.val(), userPayload);
+        }
+
+        // 5. إرسال إشعار للأدمن (تنبيه بوجود طلب جديد)
+        const adminPayload = {
+            notification: {
+                title: "طلب توثيق جديد 👤",
+                body: "قام مستخدم برفع صورة هويته، يرجى المراجعة والاتخاذ الإجراء المناسب."
+            },
+            data: {
+                click_action: "FLUTTER_NOTIFICATION_CLICK",
+                type: "NEW_VERIFICATION",
+                userUid: uid
+            }
+        };
+        // نرسل للأدمن عبر "Topic" مخصص للأدمن فقط
+        await admin.messaging().sendToTopic("admins_topic", adminPayload);
+
+        return { 
+            success: true, 
+            imageUrl: url,
+            message: "تم الرفع وإرسال الإشعارات بنجاح" 
+        };
+
+    } catch (error) {
+        console.error("Upload & Notify Error:", error);
+        throw new functions.https.HttpsError('internal', "حدث خطأ: " + error.message);
+    }
+});
+ماذا توفر لك هذه الدالة الآن؟
+الأتمتة: تأخذ المسار من Storage وتحوله لرابط دائم تلقائياً.
+
+التواصل اللحظي: المستخدم يتلقى رسالة تطمئنه بأن طلبه وصل.
+
+تنبيه الإدارة: الأدمن لا يحتاج لمراقبة قاعدة البيانات طوال الوقت، الإشعار سيصله بمجرد قيام أي مستخدم بالرفع.
+
+تحديث الحالة: تتغير حالة الحساب فوراً إلى PENDING (قيد المراجعة).
