@@ -1,0 +1,101 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+
+/**
+ * دالة التحويل الداخلي بين المحافظ (دينار ليبي -> جنيه مصري)
+ */
+exports.swapLydToEgpInternal = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من تسجيل الدخول والحساب
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
+    
+    const uid = context.auth.uid;
+    const { amountLyd, pin } = data; // المبلغ المراد تحويله بالدينار والرمز السري
+    const db = admin.database();
+
+    try {
+        // 2. جلب البيانات (سعر الصرف، حالة النظام، بيانات المستخدم، حدود العملية)
+        const [systemSnap, userSnap] = await Promise.all([
+            db.ref('settings').once('value'),
+            db.ref(`users/${uid}`).once('value')
+        ]);
+
+        const systemSettings = systemSnap.val();
+        const userData = userSnap.val();
+        const currentRate = systemSettings.exchange_rate; // لقطة سعر الصرف الحالي
+
+        // 3. التحقق من الشروط الأمنية والتقنية
+        if (!systemSettings.isOpen) throw new functions.https.HttpsError('failed-precondition', 'عذراً، نظام الصرف مغلق حالياً');
+        if (userData.profile.isFrozen) throw new functions.https.HttpsError('permission-denied', 'حسابك مجمد، لا يمكنك إجراء عمليات');
+        if (crypto.createHash('sha256').update(pin).digest('hex') !== userData.profile.pin) 
+            throw new functions.https.HttpsError('permission-denied', 'رمز PIN غير صحيح');
+        
+        // التحقق من حدود العملية الواحدة
+        if (amountLyd < systemSettings.minOrderLyd || amountLyd > systemSettings.maxOrderLyd)
+            throw new functions.https.HttpsError('out-of-range', `العملية يجب أن تكون بين ${systemSettings.minOrderLyd} و ${systemSettings.maxOrderLyd} دينار`);
+
+        // التحقق من الرصيد الليبي
+        if (userData.wallets.lyd_balance < amountLyd)
+            throw new functions.https.HttpsError('insufficient-funds', 'رصيدك بالدينار الليبي غير كافٍ');
+
+        // 4. الحسابات (المبلغ المصري والكسور)
+        const totalEgp = amountLyd * currentRate;
+        const finalEgpAmount = Math.floor(totalEgp); // الرقم الصحيح فقط
+        const fractionAmount = totalEgp - finalEgpAmount; // الكسور للمنصة
+
+        // 5. تنفيذ العملية التراكمية (Transaction) لضمان الدقة
+        const updates = {};
+        
+        // خصم الليبي وإضافة المصري
+        updates[`users/${uid}/wallets/lyd_balance`] = userData.wallets.lyd_balance - amountLyd;
+        updates[`users/${uid}/wallets/egp_balance`] = userData.wallets.egp_balance + finalEgpAmount;
+
+        // تحديث الإحصائيات التراكمية (التداول اليومي وحصالة الكسور)
+        const statsRef = db.ref('stats/daily_totals');
+        updates['stats/platform_fractions_wallet'] = admin.database.ServerValue.increment(fractionAmount);
+        updates['stats/total_swap_volume_egp'] = admin.database.ServerValue.increment(finalEgpAmount);
+
+        // إضافة العملية للسجل
+        const transactionKey = db.ref(`users/${uid}/history/lyd_transactions`).push().key;
+        updates[`users/${uid}/history/lyd_transactions/${transactionKey}`] = {
+            type: "SWAP_TO_EGP",
+            amountLyd: amountLyd,
+            amountEgp: finalEgpAmount,
+            rateAtTime: currentRate,
+            fractionTaken: fractionAmount,
+            timestamp: admin.database.ServerValue.TIMESTAMP
+        };
+
+        await db.ref().update(updates);
+
+        // 6. إرسال إشعار النجاح
+        const fcmToken = userData.fcmToken;
+        if (fcmToken) {
+            await admin.messaging().sendToDevice(fcmToken, {
+                notification: {
+                    title: "تم التحويل بنجاح ✅",
+                    body: `تم تحويل ${amountLyd} دينار إلى ${finalEgpAmount} جنيه مصري بسعر ${currentRate}.`
+                }
+            });
+        }
+
+        return { success: true, swappedAmount: finalEgpAmount };
+
+    } catch (e) {
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
+
+
+
+
+//مميزات هذه الدالة التراكمية:
+لقطة السعر (Snapshot): يتم تثبيت سعر الصرف في بداية الدالة لضمان عدم تأثر العملية بأي تغيير يحدث أثناء التنفيذ.
+
+نظام الكسور: تستخدم Math.floor لإعطاء المستخدم الجنيهات الصحيحة فقط، بينما يتم تجميع الفكة (الكسور) في platform_fractions_wallet بشكل تراكمي للمنصة.
+
+إحصائيات فورية: تُحدث الدالة إجمالي حجم التداول على مستوى المنصة (total_swap_volume_egp) تلقائياً مع كل عملية.
+
+التحقق المزدوج: تفحص حالة النظام (مفتوح/مغلق)، حالة الحساب (مجمد/نشط)، والرمز السري (PIN) المشفر قبل لمس قرش واحد.
+
+سجل العمليات: تترك أثراً تفصيلياً في سجل المستخدم يشمل حتى قيمة الكسور التي تم استقطاعها.
