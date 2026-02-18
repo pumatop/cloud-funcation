@@ -1,0 +1,47 @@
+/**
+ * دالة تجميد أو إلغاء تجميد الحساب
+ * اسم الدالة: toggleAccountFreeze
+ */
+exports.toggleAccountFreeze = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من صلاحية الأدمن
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
+    
+    const { targetUid, freezeStatus, reason } = data; // الـ UID للمستخدم، الحالة (true/false)، والسبب
+    const db = admin.database();
+
+    try {
+        const adminSnap = await db.ref(`users/${context.auth.uid}/metadata/isAdmin`).once('value');
+        if (adminSnap.val() !== true) {
+            throw new functions.https.HttpsError('permission-denied', 'هذا الإجراء للمسؤولين فقط');
+        }
+
+        // 2. تحديث حالة التجميد وتسجيل السبب
+        const updates = {
+            'profile/isFrozen': freezeStatus,
+            'metadata/freezeReason': freezeStatus ? reason : "",
+            'metadata/lastStatusChange': admin.database.ServerValue.TIMESTAMP
+        };
+
+        await db.ref(`users/${targetUid}`).update(updates);
+
+        // 3. إرسال إشعار للمستخدم بحالة حسابه الجديدة
+        const payload = {
+            notification: {
+                title: freezeStatus ? "تم تجميد حسابك ⚠️" : "تم إلغاء تجميد حسابك ✅",
+                body: freezeStatus 
+                    ? `عذراً، تم تجميد حسابك للأسباب التالية: ${reason}. يرجى التواصل مع الدعم.` 
+                    : "يسعدنا إخبارك بأنه تم إعادة تفعيل حسابك بالكامل."
+            }
+        };
+
+        const fcmTokenSnap = await db.ref(`users/${targetUid}/fcmToken`).once('value');
+        if (fcmTokenSnap.exists()) {
+            await admin.messaging().sendToDevice(fcmTokenSnap.val(), payload);
+        }
+
+        return { success: true, message: freezeStatus ? "تم تجميد الحساب" : "تم فك التجميد" };
+
+    } catch (e) {
+        throw new functions.https.HttpsError('internal', e.message);
+    }
+});
