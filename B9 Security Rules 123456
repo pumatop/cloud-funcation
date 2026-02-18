@@ -1,0 +1,57 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        // يسمح للمستخدم بقراءة بياناته الخاصة فقط
+        ".read": "auth != null && auth.uid == $uid",
+        // منع الكتابة المباشرة على أي حقل مالي أو أمني من جهة التطبيق
+        ".write": false,
+
+        "profile": {
+          // يمكن للمستخدم تعديل بيانات بسيطة (اختياري)، لكن الحقول الحساسة مغلقة
+          "isFrozen": { ".validate": false },
+          "userType": { ".validate": false },
+          "pin": { ".validate": "newData.isString()" }
+        },
+
+        "wallets": {
+          // الأرصدة (الليبي، المصري، المعلق) للقراءة فقط
+          ".read": "auth != null && auth.uid == $uid",
+          ".write": false
+        },
+
+        "history": {
+          // سجلات المعاملات للقراءة فقط لضمان عدم حذف الأدلة الممالية
+          ".read": "auth != null && auth.uid == $uid",
+          ".write": false
+        }
+      }
+    },
+
+    "withdraw_requests": {
+      // طلبات السحب: المستخدم يقرأ طلبه فقط، المندوب/الأدمن يقرأ الجميع
+      ".read": "auth != null",
+      // الدوال فقط هي من تنشئ وتعدل الطلبات
+      ".write": false
+    },
+
+    "registered_phones": {
+      // حماية خصوصية الأرقام المسجلة
+      ".read": false,
+      ".write": false
+    },
+
+    "settings": {
+      // سعر الصرف والرسوم والحدود: قراءة للجميع، تعديل ممنوع
+      ".read": "auth != null",
+      ".write": false
+    },
+
+    "stats": {
+      // الإحصائيات والإيرادات التراكمية (حصالة الكسور، أرباح الرسوم، مبيعات الكروت)
+      // متاحة فقط للأدمن للقراءة، ومغلقة تماماً للكتابة
+      ".read": "auth != null && root.child('users').child(auth.uid).child('profile').child('userType').val() === 'ADMIN'",
+      ".write": false
+    }
+  }
+}
