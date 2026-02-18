@@ -1,0 +1,102 @@
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+
+/**
+ * دالة مساعدة لتشفير الـ PIN وكلمة المرور (SHA-256)
+ */
+function hashData(data) {
+    return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+exports.createNewUserAccount = functions.https.onCall(async (data, context) => {
+    const { 
+        fullName, 
+        phoneNumber, 
+        password, 
+        pin, 
+        userType, // 'USER' (افتراضي) أو 'MERCHANT'
+        deviceInfo // نظام التشغيل، نوع الجهاز
+    } = data;
+    
+    const db = admin.database();
+    const userIP = context.rawRequest.headers['x-forwarded-for'] || context.rawRequest.connection.remoteAddress;
+
+    // 1. التحقق من طول الـ PIN (6 أرقام)
+    if (!/^\d{6}$/.test(pin)) {
+        throw new functions.https.HttpsError('invalid-argument', 'يجب أن يتكون رمز PIN من 6 أرقام');
+    }
+
+    try {
+        // 2. التحقق من عدم تكرار رقم الهاتف
+        const phoneSnap = await db.ref(`registered_phones/${phoneNumber}`).once('value');
+        if (phoneSnap.exists()) {
+            throw new functions.https.HttpsError('already-exists', 'رقم الهاتف هذا مسجل مسبقاً');
+        }
+
+        if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب إكمال التحقق');
+        const uid = context.auth.uid;
+
+        // 3. بناء هيكل الحساب الشامل
+        const userData = {
+            profile: {
+                fullName: fullName,
+                phoneNumber: phoneNumber,
+                password: hashData(password), // تشفير كلمة المرور
+                pin: hashData(pin), // تشفير الـ PIN
+                userType: userType || "USER", // الافتراضي مستخدم
+                verificationStatus: "UNVERIFIED", // الافتراضي غير موثق
+                idCardUrl: "", // سيتم ملؤه برابط الصورة عند الرفع لاحقاً
+                isFrozen: false, // إضافة حالة تجميد الحساب (الافتراضي نشط)
+                createdAt: admin.database.ServerValue.TIMESTAMP,
+                lastPasswordChange: admin.database.ServerValue.TIMESTAMP,
+                lastPinChange: admin.database.ServerValue.TIMESTAMP
+            },
+            wallets: {
+                lyd_balance: 0.0,
+                egp_balance: 0.0,
+                egp_pending_balance: 0.0 // الرصيد المصري المعلق (صفر)
+            },
+            security: {
+                activeDevice: deviceInfo || "Unknown",
+                operatingSystem: context.rawRequest.headers['user-agent'] || "Unknown",
+                lastIpAddress: userIP
+            },
+            history: {
+                lyd_transactions: {}, // سجل المعاملات الليبية
+                egp_transfers: {}     // سجل التحويلات المصرية
+            }
+        };
+
+        const batch = {};
+        batch[`users/${uid}`] = userData;
+        batch[`registered_phones/${phoneNumber}`] = uid;
+
+        await db.ref().update(batch);
+
+        // 4. إرسال الإشعار لرفع الهوية
+        const payload = {
+            notification: {
+                title: "مرحباً بك في تطبيقنا! 🎉",
+                body: "تم إنشاء حسابك بنجاح. يرجى رفع صورة الهوية لتوثيق حسابك للبدء في استخدام كافة الميزات."
+            },
+            data: {
+                action: "UPLOAD_ID_IMAGE",
+                status: "UNVERIFIED"
+            }
+        };
+
+        const fcmTokenSnap = await db.ref(`users/${uid}/fcmToken`).once('value');
+        if (fcmTokenSnap.exists()) {
+            await admin.messaging().sendToDevice(fcmTokenSnap.val(), payload);
+        }
+
+        return { 
+            success: true, 
+            message: "تم إنشاء الحساب بنجاح، يرجى رفع وثائق التوثيق" 
+        };
+
+    } catch (error) {
+        throw new functions.https.HttpsError('internal', error.message);
+    }
+});
