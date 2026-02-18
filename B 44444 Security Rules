@@ -1,0 +1,38 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        // القفل التام: لا يمكن لأي مستخدم (حتى صاحب الحساب) تعديل الأرصدة أو السجلات يدوياً
+        // التعديل يتم فقط عبر الدوال السحابية (Cloud Functions) لأنها تملك صلاحيات الأدمن
+        ".write": false,
+        
+        "wallets": {
+          ".read": "auth != null && auth.uid == $uid",
+          ".write": false
+        },
+        "history": {
+          ".read": "auth != null && auth.uid == $uid",
+          ".write": false
+        }
+      }
+    },
+    "stats": {
+      // حماية الإيرادات وحصالة الكسور وإجمالي التداول
+      // الأدمن فقط من يقرأ، والدوال فقط من تكتب
+      ".read": "auth != null && root.child('users').child(auth.uid).child('profile').child('userType').val() === 'ADMIN'",
+      ".write": false
+    },
+    "settings": {
+      // سعر الصرف وشرائح الرسوم متاحة للقراءة للتطبيق ليعرضها للمستخدم
+      // التعديل ممنوع تماماً من خارج لوحة تحكم الأدمن أو الدالة
+      ".read": "auth != null",
+      ".write": false
+    },
+    "registered_phones": {
+      // منع الوصول لقائمة أرقام الهواتف لحماية الخصوصية
+      ".read": false,
+      ".write": false
+    }
+  }
+}
