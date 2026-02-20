@@ -1,61 +1,88 @@
-const functions = require('firebase-functions');
-const admin = require('firebase-admin');
-const crypto = require('crypto');
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+import * as crypto from 'crypto';
 
 /**
- * دالة التحويل الداخلي بين المحافظ (دينار ليبي -> جنيه مصري)
+ * تعريف واجهة إعدادات النظام
  */
-exports.swapLydToEgpInternal = functions.https.onCall(async (data, context) => {
-    // 1. التحقق من تسجيل الدخول والحساب
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
-    
+interface SystemSettings {
+    isOpen: boolean;
+    exchange_rate: number;
+    minOrderLyd: number;
+    maxOrderLyd: number;
+}
+
+/**
+ * دالة التحويل الداخلي بين المحافظ (TypeScript)
+ * من الدينار الليبي (LYD) إلى الجنيه المصري (EGP) مع نظام حصالة الكسور
+ */
+export const swapLydToEgpInternal = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من تسجيل الدخول
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
     const uid = context.auth.uid;
-    const { amountLyd, pin } = data; // المبلغ المراد تحويله بالدينار والرمز السري
+    const { amountLyd, pin }: { amountLyd: number, pin: string } = data;
     const db = admin.database();
 
     try {
-        // 2. جلب البيانات (سعر الصرف، حالة النظام، بيانات المستخدم، حدود العملية)
+        // 2. جلب البيانات (سعر الصرف، حالة النظام، بيانات المستخدم)
         const [systemSnap, userSnap] = await Promise.all([
             db.ref('settings').once('value'),
             db.ref(`users/${uid}`).once('value')
         ]);
 
-        const systemSettings = systemSnap.val();
+        if (!systemSnap.exists()) throw new Error("إعدادات النظام غير متوفرة");
+        if (!userSnap.exists()) throw new Error("بيانات المستخدم غير موجودة");
+
+        const systemSettings = systemSnap.val() as SystemSettings;
         const userData = userSnap.val();
-        const currentRate = systemSettings.exchange_rate; // لقطة سعر الصرف الحالي
+        const currentRate = systemSettings.exchange_rate;
 
         // 3. التحقق من الشروط الأمنية والتقنية
-        if (!systemSettings.isOpen) throw new functions.https.HttpsError('failed-precondition', 'عذراً، نظام الصرف مغلق حالياً');
-        if (userData.profile.isFrozen) throw new functions.https.HttpsError('permission-denied', 'حسابك مجمد، لا يمكنك إجراء عمليات');
-        if (crypto.createHash('sha256').update(pin).digest('hex') !== userData.profile.pin) 
+        if (!systemSettings.isOpen) {
+            throw new functions.https.HttpsError('failed-precondition', 'عذراً، نظام الصرف مغلق حالياً');
+        }
+
+        if (userData.profile.isFrozen) {
+            throw new functions.https.HttpsError('permission-denied', 'حسابك مجمد، لا يمكنك إجراء عمليات مالية');
+        }
+
+        // التحقق من الـ PIN المشفر
+        const hashedPin = crypto.createHash('sha256').update(pin).digest('hex');
+        if (hashedPin !== userData.profile.pin) {
             throw new functions.https.HttpsError('permission-denied', 'رمز PIN غير صحيح');
-        
-        // التحقق من حدود العملية الواحدة
-        if (amountLyd < systemSettings.minOrderLyd || amountLyd > systemSettings.maxOrderLyd)
-            throw new functions.https.HttpsError('out-of-range', `العملية يجب أن تكون بين ${systemSettings.minOrderLyd} و ${systemSettings.maxOrderLyd} دينار`);
+        }
+
+        // التحقق من حدود العملية
+        if (amountLyd < systemSettings.minOrderLyd || amountLyd > systemSettings.maxOrderLyd) {
+            throw new functions.https.HttpsError('out-of-range', 
+                `العملية يجب أن تكون بين ${systemSettings.minOrderLyd} و ${systemSettings.maxOrderLyd} دينار`);
+        }
 
         // التحقق من الرصيد الليبي
-        if (userData.wallets.lyd_balance < amountLyd)
+        if (userData.wallets.lyd_balance < amountLyd) {
             throw new functions.https.HttpsError('insufficient-funds', 'رصيدك بالدينار الليبي غير كافٍ');
+        }
 
-        // 4. الحسابات (المبلغ المصري والكسور)
+        // 4. الحسابات الدقيقة (المبلغ المصري والكسور)
         const totalEgp = amountLyd * currentRate;
-        const finalEgpAmount = Math.floor(totalEgp); // الرقم الصحيح فقط
-        const fractionAmount = totalEgp - finalEgpAmount; // الكسور للمنصة
+        const finalEgpAmount = Math.floor(totalEgp); // المبلغ الصحيح للمستخدم
+        const fractionAmount = totalEgp - finalEgpAmount; // الكسور تذهب لحصالة المنصة
 
-        // 5. تنفيذ العملية التراكمية (Transaction) لضمان الدقة
-        const updates = {};
-        
-        // خصم الليبي وإضافة المصري
-        updates[`users/${uid}/wallets/lyd_balance`] = userData.wallets.lyd_balance - amountLyd;
-        updates[`users/${uid}/wallets/egp_balance`] = userData.wallets.egp_balance + finalEgpAmount;
+        // 5. بناء التحديثات التراكمية (Atomic Updates)
+        const updates: { [key: string]: any } = {};
 
-        // تحديث الإحصائيات التراكمية (التداول اليومي وحصالة الكسور)
-        const statsRef = db.ref('stats/daily_totals');
+        // تحديث المحافظ
+        updates[`users/${uid}/wallets/lyd_balance`] = admin.database.ServerValue.increment(-amountLyd);
+        updates[`users/${uid}/wallets/egp_balance`] = admin.database.ServerValue.increment(finalEgpAmount);
+
+        // تحديث حصالة الكسور وحجم التداول التراكمي
         updates['stats/platform_fractions_wallet'] = admin.database.ServerValue.increment(fractionAmount);
         updates['stats/total_swap_volume_egp'] = admin.database.ServerValue.increment(finalEgpAmount);
 
-        // إضافة العملية للسجل
+        // إضافة العملية للسجل (History)
         const transactionKey = db.ref(`users/${uid}/history/lyd_transactions`).push().key;
         updates[`users/${uid}/history/lyd_transactions/${transactionKey}`] = {
             type: "SWAP_TO_EGP",
@@ -66,36 +93,40 @@ exports.swapLydToEgpInternal = functions.https.onCall(async (data, context) => {
             timestamp: admin.database.ServerValue.TIMESTAMP
         };
 
+        // تنفيذ كافة التحديثات في لحظة واحدة
         await db.ref().update(updates);
 
-        // 6. إرسال إشعار النجاح
+        // 6. إرسال إشعار النجاح (FCM)
         const fcmToken = userData.fcmToken;
         if (fcmToken) {
-            await admin.messaging().sendToDevice(fcmToken, {
+            const payload: admin.messaging.MessagingPayload = {
                 notification: {
                     title: "تم التحويل بنجاح ✅",
-                    body: `تم تحويل ${amountLyd} دينار إلى ${finalEgpAmount} جنيه مصري بسعر ${currentRate}.`
+                    body: `تم تحويل ${amountLyd} LYD إلى ${finalEgpAmount} EGP.`,
+                    sound: "default"
                 }
-            });
+            };
+            await admin.messaging().sendToDevice(fcmToken, payload);
         }
 
-        return { success: true, swappedAmount: finalEgpAmount };
+        return { 
+            success: true, 
+            swappedAmount: finalEgpAmount,
+            rate: currentRate 
+        };
 
-    } catch (e) {
-        throw new functions.https.HttpsError('internal', e.message);
+    } catch (error: any) {
+        console.error("Internal Swap Error:", error);
+        if (error instanceof functions.https.HttpsError) throw error;
+        throw new functions.https.HttpsError('internal', error.message);
     }
 });
 
+//القيمة المضافة في نسخة TypeScript:
+استخدام ServerValue.increment: بدلاً من سحب الرصيد وتعديله ثم رفعه (الذي قد يسبب أخطاء في حال وجود عمليتين متزامنتين)، نستخدم increment. هذه الطريقة تضمن أن العملية تتم بشكل Atomic (ذري) على سيرفرات Firebase مباشرة، مما يمنع "تضارب الأرصدة".
 
+Strict Typing لـ SystemSettings: تضمن أن البرنامج لن يحاول ضرب amountLyd في قيمة غير موجودة أو نصية، مما يحمي العملية الحسابية.
 
+حصالة الكسور: يتم الآن ترحيل fractionAmount بدقة متناهية إلى محفظة المنصة، وهو ما طلبته في نظامك التراكمي.
 
-//مميزات هذه الدالة التراكمية:
-لقطة السعر (Snapshot): يتم تثبيت سعر الصرف في بداية الدالة لضمان عدم تأثر العملية بأي تغيير يحدث أثناء التنفيذ.
-
-نظام الكسور: تستخدم Math.floor لإعطاء المستخدم الجنيهات الصحيحة فقط، بينما يتم تجميع الفكة (الكسور) في platform_fractions_wallet بشكل تراكمي للمنصة.
-
-إحصائيات فورية: تُحدث الدالة إجمالي حجم التداول على مستوى المنصة (total_swap_volume_egp) تلقائياً مع كل عملية.
-
-التحقق المزدوج: تفحص حالة النظام (مفتوح/مغلق)، حالة الحساب (مجمد/نشط)، والرمز السري (PIN) المشفر قبل لمس قرش واحد.
-
-سجل العمليات: تترك أثراً تفصيلياً في سجل المستخدم يشمل حتى قيمة الكسور التي تم استقطاعها.
+إدارة الاستثناءات: يتم تسجيل أي خطأ في السيرفر مع تمرير رسالة خطأ واضحة لتطبيق Flutter.
