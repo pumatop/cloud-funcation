@@ -1,76 +1,92 @@
-const functions = require('firebase-functions');
-const admin = require('firebase-admin');
-const crypto = require('crypto');
-const axios = require('axios');
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+import * as crypto from 'crypto';
+import axios from 'axios';
+
+// --- تعريف واجهات البيانات ---
+
+interface TelecomApiSettings {
+    url: string;
+    key: string;
+}
+
+interface ApiResponse {
+    status: string;
+    pin_code: string;
+    message?: string;
+}
 
 /**
  * دالة شراء كروت الشحن (المدار، ليبيانا، LTT)
- * القيمة بالكامل تُحسب كإيراد للمنصة
+ * القيمة بالكامل تُحسب كإيراد للمنصة بشكل تراكمي
  */
-exports.purchaseTelecomCard = functions.https.onCall(async (data, context) => {
+export const purchaseTelecomCard = functions.https.onCall(async (data, context) => {
     // 1. التحقق من المصادقة
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
-    
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
     const uid = context.auth.uid;
-    const { provider, cardValue, pin } = data; // المدار، ليبيانا، أو LTT والقيمة (مثلاً 5، 10 د.ل)
+    const { provider, cardValue, pin }: { provider: string, cardValue: number | string, pin: string } = data;
     const db = admin.database();
 
     try {
-        // 2. جلب بيانات المستخدم وإعدادات الـ API
+        // 2. جلب البيانات المتوازية (المستخدم وإعدادات المزود)
         const [userSnap, apiSettingsSnap] = await Promise.all([
             db.ref(`users/${uid}`).once('value'),
             db.ref('settings/telecom_api').once('value')
         ]);
 
+        if (!userSnap.exists()) throw new Error("بيانات المستخدم غير موجودة");
         const userData = userSnap.val();
-        const apiSettings = apiSettingsSnap.val();
+        const apiSettings = apiSettingsSnap.val() as TelecomApiSettings;
 
-        // 3. الشروط الأمنية
-        if (userData.profile.isFrozen) throw new functions.https.HttpsError('permission-denied', 'حسابك مجمد');
-        
-        // التحقق من PIN
+        // 3. الفحوصات الأمنية
+        if (userData.profile.isFrozen) {
+            throw new functions.https.HttpsError('permission-denied', 'حسابك مجمد، لا يمكنك الشراء حالياً');
+        }
+
         const hashedPin = crypto.createHash('sha256').update(pin).digest('hex');
         if (hashedPin !== userData.profile.pin) {
             throw new functions.https.HttpsError('permission-denied', 'رمز PIN غير صحيح');
         }
 
-        // التحقق من الرصيد
-        const totalCost = parseFloat(cardValue);
+        const totalCost = typeof cardValue === 'string' ? parseFloat(cardValue) : cardValue;
         if (userData.wallets.lyd_balance < totalCost) {
-            throw new functions.https.HttpsError('insufficient-funds', 'رصيدك غير كافٍ لشراء هذا الكرت');
+            throw new functions.https.HttpsError('insufficient-funds', 'رصيدك غير كافٍ لإتمام عملية الشراء');
         }
 
-        // 4. الاتصال بـ API مزود الخدمة الخارجي
-        // يتم إرسال طلب الشراء للمزود الخارجي
-        const apiResponse = await axios.post(apiSettings.url, {
+        // 4. الاتصال بالمزود الخارجي (External API)
+        const response = await axios.post<ApiResponse>(apiSettings.url, {
             apiKey: apiSettings.key,
             service: provider,
             amount: cardValue
         }).catch(err => {
-            throw new functions.https.HttpsError('internal', 'عذراً، فشل الاتصال بمزود الخدمة الخارجي');
+            console.error("Axios Error:", err.message);
+            throw new functions.https.HttpsError('internal', 'فشل الاتصال بمزود الكروت الخارجي');
         });
 
-        if (apiResponse.data.status !== 'success') {
-            throw new functions.https.HttpsError('unavailable', 'المزود الخارجي غير متاح حالياً');
+        if (response.data.status !== 'success') {
+            throw new functions.https.HttpsError('unavailable', `المزود الخارجي اعتذر عن الطلب: ${response.data.message || 'غير متاح'}`);
         }
 
-        const voucherCode = apiResponse.data.pin_code; // كود الشحن المستلم
+        const voucherCode = response.data.pin_code;
 
-        // 5. التحديثات التراكمية (المالية والإحصائية)
+        // 5. التحديثات المالية والإحصائية التراكمية (Atomic Updates)
         const now = new Date();
         const dayKey = now.toISOString().split('T')[0];
         const monthKey = dayKey.substring(0, 7);
-        const updates = {};
+        const updates: { [key: string]: any } = {};
 
-        // خصم القيمة من رصيد المستخدم
+        // خصم الرصيد
         updates[`users/${uid}/wallets/lyd_balance`] = admin.database.ServerValue.increment(-totalCost);
 
-        // تسجيل إيرادات الكروت التراكمي (القيمة بالكامل حسب ملاحظتك)
+        // إيرادات الكروت التراكمية للمنصة
         updates[`stats/revenue/telecom_cards/daily/${dayKey}`] = admin.database.ServerValue.increment(totalCost);
         updates[`stats/revenue/telecom_cards/monthly/${monthKey}`] = admin.database.ServerValue.increment(totalCost);
         updates[`stats/revenue/telecom_cards/total_all_time`] = admin.database.ServerValue.increment(totalCost);
 
-        // سجل العملية للمستخدم
+        // سجل العملية
         const logKey = db.ref(`users/${uid}/history/telecom_purchases`).push().key;
         const logData = {
             provider,
@@ -79,34 +95,27 @@ exports.purchaseTelecomCard = functions.https.onCall(async (data, context) => {
             timestamp: admin.database.ServerValue.TIMESTAMP,
             status: "SUCCESS"
         };
-        updates[`users/${uid}/history/telecom_purchases/${logKey}`] = logData;
 
-        // نسخة لسجل الإحصائيات العام للمنصة (التداول التراكمي)
+        updates[`users/${uid}/history/telecom_purchases/${logKey}`] = logData;
         updates[`stats/logs/telecom_sales/${logKey}`] = { ...logData, userUid: uid };
 
         await db.ref().update(updates);
 
-        // 6. إرسال إشعار للمستخدم
+        // 6. الإشعارات اللحظية
         if (userData.fcmToken) {
             await admin.messaging().sendToDevice(userData.fcmToken, {
                 notification: {
                     title: "شراء ناجح 🎉",
-                    body: `كود شحن ${provider}: ${voucherCode}. تم خصم ${totalCost} د.ل من رصيدك.`
+                    body: `كود شحن ${provider}: ${voucherCode}. تم خصم ${totalCost} د.ل.`
                 }
             });
         }
 
         return { success: true, voucher: voucherCode };
 
-    } catch (e) {
-        throw new functions.https.HttpsError('internal', e.message);
+    } catch (error: any) {
+        console.error("Telecom Purchase Error:", error);
+        if (error instanceof functions.https.HttpsError) throw error;
+        throw new functions.https.HttpsError('internal', error.message);
     }
 });
-
-إلغاء العمولات: تم إلغاء أي حسابات للرسوم أو "الفيز" (Fees).
-
-إيراد مباشر: المبلغ المخصوم من المستخدم (totalCost) يُضاف مباشرة إلى سجلات الإيرادات اليومية والشهرية للمنصة تحت بند مبيعات الكروت.
-
-التراكم الذكي: تُسجل المبيعات بشكل تراكمي يومي (daily) وشهري (monthly) وإجمالي (total_all_time) لتسهيل الحسابات الختامية.
-
-التوثيق: يتم حفظ كود الكرت المستلم من الـ API في سجلات المستخدم لضمان وصوله إليه حتى لو فقد الإشعار.
