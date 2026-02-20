@@ -1,53 +1,102 @@
-const functions = require('firebase-functions');
-const admin = require('firebase-admin');
-const crypto = require('crypto');
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+import * as crypto from 'crypto';
 
-/**
- * دالة مساعدة لتشفير الـ PIN وكلمة المرور (SHA-256)
- */
-function hashData(data) {
-    return crypto.createHash('sha256').update(data).digest('hex');
+admin.initializeApp();
+const db = admin.database();
+
+// --- 1. تعريف واجهات البيانات (Interfaces) ---
+
+interface UserWallets {
+    lyd_balance: number;
+    egp_balance: number;
+    egp_pending_balance: number;
 }
 
-exports.createNewUserAccount = functions.https.onCall(async (data, context) => {
+interface UserProfile {
+    fullName: string;
+    phoneNumber: string;
+    password: string;
+    pin: string;
+    userType: 'USER' | 'MERCHANT' | 'ADMIN' | 'DELEGATE';
+    verificationStatus: 'UNVERIFIED' | 'PENDING' | 'VERIFIED';
+    idCardUrl: string;
+    isFrozen: boolean;
+    createdAt: object;
+    lastPasswordChange: object;
+    lastPinChange: object;
+}
+
+interface UserAccount {
+    profile: UserProfile;
+    wallets: UserWallets;
+    security: {
+        activeDevice: string;
+        operatingSystem: string;
+        lastIpAddress: string;
+    };
+    history: {
+        lyd_transactions: object;
+        egp_transfers: object;
+    };
+}
+
+// --- 2. الدوال المساعدة ---
+
+/**
+ * تشفير البيانات باستخدام SHA-256
+ */
+const hashData = (data: string): string => {
+    return crypto.createHash('sha256').update(data).digest('hex');
+};
+
+// --- 3. الدالة الأساسية ---
+
+/**
+ * اسم الدالة: createNewUserAccount
+ * الوظيفة: إنشاء حساب مستخدم جديد مع تشفير البيانات وتصفير المحافظ
+ */
+export const createNewUserAccount = functions.https.onCall(async (data, context) => {
     const { 
         fullName, 
         phoneNumber, 
         password, 
         pin, 
-        userType, // 'USER' (افتراضي) أو 'MERCHANT'
-        deviceInfo // نظام التشغيل، نوع الجهاز
+        userType, 
+        deviceInfo 
     } = data;
-    
-    const db = admin.database();
-    const userIP = context.rawRequest.headers['x-forwarded-for'] || context.rawRequest.connection.remoteAddress;
 
-    // 1. التحقق من طول الـ PIN (6 أرقام)
+    // التحقق من صحة الـ PIN (6 أرقام)
     if (!/^\d{6}$/.test(pin)) {
         throw new functions.https.HttpsError('invalid-argument', 'يجب أن يتكون رمز PIN من 6 أرقام');
     }
 
+    // التحقق من وجود UID للمستخدم من Firebase Auth
+    const uid = context.auth?.uid;
+    if (!uid) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب إكمال عملية التحقق من رقم الهاتف أولاً');
+    }
+
+    const userIP = context.rawRequest.headers['x-forwarded-for'] as string || context.rawRequest.connection.remoteAddress || "Unknown";
+
     try {
-        // 2. التحقق من عدم تكرار رقم الهاتف
+        // التحقق من عدم تكرار رقم الهاتف في قاعدة البيانات
         const phoneSnap = await db.ref(`registered_phones/${phoneNumber}`).once('value');
         if (phoneSnap.exists()) {
-            throw new functions.https.HttpsError('already-exists', 'رقم الهاتف هذا مسجل مسبقاً');
+            throw new functions.https.HttpsError('already-exists', 'رقم الهاتف هذا مسجل مسبقاً في النظام');
         }
 
-        if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب إكمال التحقق');
-        const uid = context.auth.uid;
-
-        // 3. بناء هيكل الحساب الشامل
-        const userData = {
+        // بناء الكائن باستخدام الـ Interface لضمان دقة البيانات
+        const userData: UserAccount = {
             profile: {
                 fullName: fullName,
                 phoneNumber: phoneNumber,
-                password: hashData(password), // تشفير كلمة المرور
-                pin: hashData(pin), // تشفير الـ PIN
-                userType: userType || "USER", // الافتراضي مستخدم
-                verificationStatus: "UNVERIFIED", // الافتراضي غير موثق
-                idCardUrl: "", // سيتم ملؤه برابط الصورة عند الرفع لاحقاً
-                isFrozen: false, // إضافة حالة تجميد الحساب (الافتراضي نشط)
+                password: hashData(password),
+                pin: hashData(pin),
+                userType: userType || "USER",
+                verificationStatus: "UNVERIFIED",
+                idCardUrl: "",
+                isFrozen: false,
                 createdAt: admin.database.ServerValue.TIMESTAMP,
                 lastPasswordChange: admin.database.ServerValue.TIMESTAMP,
                 lastPinChange: admin.database.ServerValue.TIMESTAMP
@@ -55,7 +104,7 @@ exports.createNewUserAccount = functions.https.onCall(async (data, context) => {
             wallets: {
                 lyd_balance: 0.0,
                 egp_balance: 0.0,
-                egp_pending_balance: 0.0 // الرصيد المصري المعلق (صفر)
+                egp_pending_balance: 0.0
             },
             security: {
                 activeDevice: deviceInfo || "Unknown",
@@ -63,52 +112,37 @@ exports.createNewUserAccount = functions.https.onCall(async (data, context) => {
                 lastIpAddress: userIP
             },
             history: {
-                lyd_transactions: {}, // سجل المعاملات الليبية
-                egp_transfers: {}     // سجل التحويلات المصرية
+                lyd_transactions: {},
+                egp_transfers: {}
             }
         };
 
-        const batch = {};
+        const batch: { [key: string]: any } = {};
         batch[`users/${uid}`] = userData;
         batch[`registered_phones/${phoneNumber}`] = uid;
 
+        // تنفيذ عملية الكتابة الجماعية (Atomic Batch)
         await db.ref().update(batch);
 
-        // 4. إرسال الإشعار لرفع الهوية
-        const payload = {
-            notification: {
-                title: "مرحباً بك في تطبيقنا! 🎉",
-                body: "تم إنشاء حسابك بنجاح. يرجى رفع صورة الهوية لتوثيق حسابك للبدء في استخدام كافة الميزات."
-            },
-            data: {
-                action: "UPLOAD_ID_IMAGE",
-                status: "UNVERIFIED"
-            }
-        };
-
+        // محاولة إرسال إشعار ترحيبي إذا كان التوكن متاحاً
         const fcmTokenSnap = await db.ref(`users/${uid}/fcmToken`).once('value');
         if (fcmTokenSnap.exists()) {
+            const payload = {
+                notification: {
+                    title: "مرحباً بك! 🎉",
+                    body: "تم إنشاء حسابك. يرجى رفع صورة الهوية لتوثيق الحساب."
+                },
+                data: { action: "UPLOAD_ID_IMAGE" }
+            };
             await admin.messaging().sendToDevice(fcmTokenSnap.val(), payload);
         }
 
         return { 
             success: true, 
-            message: "تم إنشاء الحساب بنجاح، يرجى رفع وثائق التوثيق" 
+            message: "تم إنشاء الحساب بنجاح بنظام TypeScript التراكمي" 
         };
 
-    } catch (error) {
+    } catch (error: any) {
         throw new functions.https.HttpsError('internal', error.message);
     }
 });
-
-
-//تفاصيل النظام التراكمي في هذه الدالة:
-الأرصدة الثلاثية: تم ضبط (الدينار، الجنيه، والجنيه المعلق) جميعاً بقيمة 0.0.
-
-التشفير المزدوج: لا يتم تخزين كلمة المرور ولا الـ PIN كنصوص واضحة؛ كلاهما يُشفر فوراً قبل دخول قاعدة البيانات.
-
-تتبع الجهاز (Active Device): تقوم الدالة بالتقاط عنوان الـ IP ونظام التشغيل تلقائياً من طلب المستخدم لزيادة الأمان.
-
-منع التكرار: يتم حجز رقم الهاتف في مسار registered_phones لمنع استخدامه في حساب آخر.
-
-التاريخ الزمني: تم تعيين طوابع زمنية (Timestamps) دقيقة لكل من (إنشاء الحساب، تغيير كلمة المرور، وتغيير الـ PIN) لمراقبة شرط الـ 24 ساعة لاحقاً.
