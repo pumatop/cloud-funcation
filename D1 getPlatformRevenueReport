@@ -1,0 +1,84 @@
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+
+/**
+ * دالة توليد تقارير الأرباح الشاملة (TypeScript)
+ * المصادر: رسوم التحويل، رسوم السحب، مبيعات الكروت، وحصالة الكسور
+ */
+export const getPlatformRevenueReport = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من صلاحية الأدمن حصراً
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
+    }
+
+    const adminUid = context.auth.uid;
+    const db = admin.database();
+
+    try {
+        // التحقق من أن المستخدم هو ADMIN
+        const adminSnap = await db.ref(`users/${adminUid}/profile/userType`).once('value');
+        if (adminSnap.val() !== 'ADMIN') {
+            throw new functions.https.HttpsError('permission-denied', 'هذا التقرير مخصص للإدارة العليا فقط');
+        }
+
+        // 2. جلب كافة مسارات الإيرادات التراكمية في وقت واحد
+        const [revenueSnap, statsSnap] = await Promise.all([
+            db.ref('stats/revenue').once('value'),
+            db.ref('stats').once('value')
+        ]);
+
+        const revenue = revenueSnap.val() || {};
+        const stats = statsSnap.val() || {};
+
+        // 3. تحليل وتجميع البيانات
+        
+        // أ - أرباح التحويلات (LYD)
+        const lydTransferRevenue = revenue.lyd_transfers?.total_all_time || 0;
+
+        // ب - أرباح السحب (EGP)
+        const egpWithdrawFees = revenue.egp_fees?.total_all_time || 0;
+
+        // ج - إيرادات مبيعات الكروت (LYD) - (حسب ملاحظتك: القيمة بالكامل إيراد)
+        const telecomRevenue = revenue.telecom_cards?.total_all_time || 0;
+
+        // د - حصالة الكسور (Platform Fractions)
+        // الكسور ناتجة عن تحويل LYD إلى EGP (تم تجميعها في محفظة خاصة)
+        const fractionsWallet = stats.platform_fractions_wallet || 0;
+
+        // هـ - إجمالي حجم التداول (Volume) لتقييم أداء المنصة
+        const totalSwapVolume = stats.total_swap_volume_egp || 0;
+
+        // 4. بناء التقرير النهائي
+        return {
+            success: true,
+            timestamp: admin.database.ServerValue.TIMESTAMP,
+            summary: {
+                total_lyd_revenue: lydTransferRevenue + telecomRevenue,
+                total_egp_revenue: egpWithdrawFees,
+                platform_fractions: fractionsWallet
+            },
+            details: {
+                transfer_fees_lyd: lydTransferRevenue,
+                telecom_sales_lyd: telecomRevenue,
+                withdrawal_fees_egp: egpWithdrawFees,
+                total_swapped_volume_egp: totalSwapVolume
+            },
+            // يمكن إضافة إيرادات اليوم الحالي للمقارنة
+            today_performance: {
+                lyd: (revenue.lyd_transfers?.daily?.[getTodayKey()] || 0) + (revenue.telecom_cards?.daily?.[getTodayKey()] || 0),
+                egp: revenue.egp_fees?.daily?.[getTodayKey()] || 0
+            }
+        };
+
+    } catch (error: any) {
+        console.error("Revenue Report Error:", error);
+        throw new functions.https.HttpsError('internal', "فشل في توليد التقرير: " + error.message);
+    }
+});
+
+/**
+ * دالة مساعدة للحصول على مفتاح اليوم الحالي
+ */
+function getTodayKey(): string {
+    return new Date().toISOString().split('T')[0];
+}
