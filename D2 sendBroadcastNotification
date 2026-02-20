@@ -1,0 +1,82 @@
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+
+/**
+ * دالة إرسال الإشعارات الجماعية (TypeScript)
+ * الوظيفة: إرسال تنبيهات لكل المستخدمين أو لفئة معينة (Topics)
+ */
+export const sendBroadcastNotification = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من صلاحية الأدمن
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
+    }
+
+    const adminUid = context.auth.uid;
+    const { title, body, targetTopic, dataPayload } = data; 
+    // targetTopic: يمكن أن يكون 'all_users' أو 'delegates'
+    
+    const db = admin.database();
+
+    try {
+        // التحقق من الرتبة (ADMIN فقط)
+        const adminSnap = await db.ref(`users/${adminUid}/profile/userType`).once('value');
+        if (adminSnap.val() !== 'ADMIN') {
+            throw new functions.https.HttpsError('permission-denied', 'هذه الصلاحية للأدمن فقط');
+        }
+
+        if (!title || !body) {
+            throw new functions.https.HttpsError('invalid-argument', 'يجب تحديد عنوان ونص الرسالة');
+        }
+
+        // 2. إعداد رسالة FCM
+        const topicName = targetTopic || 'all_users'; // الافتراضي لكل المستخدمين
+        
+        const message: admin.messaging.TopicMessage = {
+            notification: {
+                title: title,
+                body: body,
+            },
+            // حقول إضافية لنقل بيانات برمجية داخل الإشعار (مثل الانتقال لصفحة معينة)
+            data: dataPayload || {},
+            topic: topicName,
+            android: {
+                priority: "high",
+                notification: {
+                    sound: "default",
+                    channelId: "high_importance_channel"
+                }
+            },
+            apns: {
+                payload: {
+                    aps: {
+                        sound: "default"
+                    }
+                }
+            }
+        };
+
+        // 3. إرسال الإشعار عبر نظام المواضيع (Topic Messaging)
+        const response = await admin.messaging().send(message);
+
+        // 4. توثيق الإشعار في سجل الإشعارات المرسلة (للمراجعة لاحقاً)
+        const broadcastLogKey = db.ref('stats/broadcast_logs').push().key;
+        await db.ref(`stats/broadcast_logs/${broadcastLogKey}`).set({
+            title,
+            body,
+            topic: topicName,
+            sentBy: adminUid,
+            timestamp: admin.database.ServerValue.TIMESTAMP,
+            responseId: response
+        });
+
+        return { 
+            success: true, 
+            message: `تم إرسال الإشعار بنجاح إلى ${topicName}`,
+            messageId: response 
+        };
+
+    } catch (error: any) {
+        console.error("Broadcast Notification Error:", error);
+        throw new functions.https.HttpsError('internal', "فشل إرسال الإشعار الجماعي");
+    }
+});
