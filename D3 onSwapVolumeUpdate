@@ -1,0 +1,83 @@
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+
+/**
+ * دالة مراقبة حجم التداول اللحظية
+ * تعمل تلقائياً عند أي تغيير في قيمة total_swap_volume_egp
+ */
+export const onSwapVolumeUpdate = functions.database.ref('stats/total_swap_volume_egp')
+    .onUpdate(async (change, context) => {
+        const newVolume = change.after.val(); // القيمة الجديدة بعد عملية التحويل
+        const db = admin.database();
+
+        // 1. جلب الإعدادات الحالية
+        const settingsSnap = await db.ref('settings').once('value');
+        const settings = settingsSnap.val();
+
+        if (!settings) return null;
+
+        const updates: { [key: string]: any } = {};
+        let notificationTitle = "";
+        let notificationBody = "";
+
+        // الفحص الأول: الإغلاق التلقائي (Kill-Switch)
+        // إذا كان السوق مفتوحاً ووصلنا للسقف المحدد
+        if (settings.isOpen && settings.autoCloseLimit && newVolume >= settings.autoCloseLimit) {
+            updates['settings/isOpen'] = false;
+            notificationTitle = "🚨 إغلاق تلقائي (سقف التداول)";
+            notificationBody = `تم إغلاق الصرف فوراً لوصول التداول إلى ${newVolume} ج.م.`;
+        }
+
+        // الفحص الثاني: قواعد السعر بناءً على حجم التداول (Volume Rules)
+        const rules = settings.autoUpdateRules as any[];
+        if (settings.isOpen && rules && !updates['settings/isOpen']) {
+            // نبحث عن القواعد من نوع VOLUME فقط
+            for (const rule of rules) {
+                if (rule.isActive && rule.type === 'VOLUME' && newVolume >= rule.value) {
+                    // إذا كان السعر الحالي مختلف عن سعر الهدف في القاعدة
+                    if (settings.exchange_rate !== rule.targetRate) {
+                        const oldRate = settings.exchange_rate;
+                        updates['settings/exchange_rate'] = rule.targetRate;
+                        
+                        notificationTitle = "📉 تحديث تلقائي (حجم التداول)";
+                        notificationBody = `تغير السعر إلى ${rule.targetRate} بسبب وصول التداول لـ ${newVolume} ج.م.`;
+
+                        // تسجيل في السجل التاريخي
+                        const logKey = db.ref('settings/rate_history').push().key;
+                        updates[`settings/rate_history/${logKey}`] = {
+                            oldRate: oldRate,
+                            newRate: rule.targetRate,
+                            changePercent: "تلقائي (Volume)",
+                            changedBy: "SYSTEM_MONITOR",
+                            reason: `الوصول لمبلغ تداول: ${rule.value}`,
+                            timestamp: admin.database.ServerValue.TIMESTAMP
+                        };
+                    }
+                    break; // تنفيذ أول قاعدة محققة
+                }
+            }
+        }
+
+        // 2. تنفيذ التحديثات إذا وجد أي تغيير
+        if (Object.keys(updates).length > 0) {
+            await db.ref().update(updates);
+            
+            // 3. إرسال إشعار فوري للأدمن
+            const payload = {
+                notification: { title: notificationTitle, body: notificationBody, sound: "default" },
+                data: { type: "VOLUME_ALERT" }
+            };
+            await admin.messaging().sendToTopic("admin_alerts", payload);
+        }
+
+        return null;
+    });
+
+    //مميزات هذا التطوير اللحظي:
+بدون تأخير (Zero Latency): الدالة لا تنتظر 5 دقائق؛ هي تعمل في الأجزاء من الثانية التي تلي عملية التحويل مباشرة. بمجرد أن يضغط المستخدم على "تحويل" ويزيد العداد، يتم الفحص.
+
+المقارنة المباشرة: تأخذ القيمة الجديدة newVolume وتقارنها فوراً بـ autoCloseLimit وبقائمة الـ rules.
+
+توفير الجهد: لن تحتاج إلى تشغيل دوال مجدولة (Cron Jobs) لفحص المبالغ، مما يقلل من استهلاك موارد Firebase.
+
+دقة السجلات: السجل سيوضح بدقة أن التغيير حدث بسبب "الوصول لمبلغ تداول محدد"، مما يسهل عليك مراجعة العمليات المالية لاحقاً.
