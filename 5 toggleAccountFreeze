@@ -1,47 +1,70 @@
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+
 /**
- * دالة تجميد أو إلغاء تجميد الحساب
- * اسم الدالة: toggleAccountFreeze
+ * دالة تجميد أو إلغاء تجميد الحساب (TypeScript)
+ * الوظيفة: التحكم في حالة دخول المستخدم وقدرته على إجراء العمليات الممالية
  */
-exports.toggleAccountFreeze = functions.https.onCall(async (data, context) => {
-    // 1. التحقق من صلاحية الأدمن
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
-    
-    const { targetUid, freezeStatus, reason } = data; // الـ UID للمستخدم، الحالة (true/false)، والسبب
+export const toggleAccountFreeze = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من المصادقة الأساسية
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const adminUid = context.auth.uid;
+    const { targetUid, freezeStatus, reason }: { targetUid: string, freezeStatus: boolean, reason?: string } = data;
     const db = admin.database();
 
     try {
-        const adminSnap = await db.ref(`users/${context.auth.uid}/metadata/isAdmin`).once('value');
-        if (adminSnap.val() !== true) {
-            throw new functions.https.HttpsError('permission-denied', 'هذا الإجراء للمسؤولين فقط');
+        // 2. التحقق من صلاحية الأدمن (باستخدام المسار الموحد profile/userType)
+        const adminSnap = await db.ref(`users/${adminUid}/profile/userType`).once('value');
+        if (adminSnap.val() !== 'ADMIN') {
+            throw new functions.https.HttpsError('permission-denied', 'هذا الإجراء مخصص للمسؤولين فقط');
         }
 
-        // 2. تحديث حالة التجميد وتسجيل السبب
-        const updates = {
+        // 3. التحقق من وجود المستخدم المستهدف
+        const userSnap = await db.ref(`users/${targetUid}`).once('value');
+        if (!userSnap.exists()) {
+            throw new functions.https.HttpsError('not-found', 'المستخدم المستهدف غير موجود');
+        }
+
+        // 4. إعداد التحديثات (Updates Object)
+        const updates: { [key: string]: any } = {
             'profile/isFrozen': freezeStatus,
-            'metadata/freezeReason': freezeStatus ? reason : "",
+            'profile/freezeReason': freezeStatus ? (reason || "مخالفة شروط الاستخدام") : null,
             'metadata/lastStatusChange': admin.database.ServerValue.TIMESTAMP
         };
 
         await db.ref(`users/${targetUid}`).update(updates);
 
-        // 3. إرسال إشعار للمستخدم بحالة حسابه الجديدة
-        const payload = {
-            notification: {
-                title: freezeStatus ? "تم تجميد حسابك ⚠️" : "تم إلغاء تجميد حسابك ✅",
-                body: freezeStatus 
-                    ? `عذراً، تم تجميد حسابك للأسباب التالية: ${reason}. يرجى التواصل مع الدعم.` 
-                    : "يسعدنا إخبارك بأنه تم إعادة تفعيل حسابك بالكامل."
-            }
-        };
+        // 5. في حالة التجميد: طرد المستخدم من جميع الجلسات النشطة فوراً
+        if (freezeStatus) {
+            await admin.auth().revokeRefreshTokens(targetUid);
+        }
 
+        // 6. نظام الإشعارات (FCM)
         const fcmTokenSnap = await db.ref(`users/${targetUid}/fcmToken`).once('value');
         if (fcmTokenSnap.exists()) {
+            const payload: admin.messaging.MessagingPayload = {
+                notification: {
+                    title: freezeStatus ? "تنبيه: تم تجميد الحساب ⚠️" : "تم إعادة تفعيل حسابك ✅",
+                    body: freezeStatus 
+                        ? `تم تجميد حسابك للسبب التالي: ${reason}. يرجى التواصل مع الدعم.` 
+                        : "تم فك تجميد حسابك، يمكنك الآن العودة لاستخدام التطبيق.",
+                    sound: "default"
+                }
+            };
             await admin.messaging().sendToDevice(fcmTokenSnap.val(), payload);
         }
 
-        return { success: true, message: freezeStatus ? "تم تجميد الحساب" : "تم فك التجميد" };
+        return { 
+            success: true, 
+            message: freezeStatus ? "تم تجميد الحساب وطرد الجلسات" : "تم إلغاء التجميد بنجاح" 
+        };
 
-    } catch (e) {
-        throw new functions.https.HttpsError('internal', e.message);
+    } catch (error: any) {
+        console.error("Freeze Toggle Error:", error);
+        if (error instanceof functions.https.HttpsError) throw error;
+        throw new functions.https.HttpsError('internal', error.message);
     }
 });
