@@ -1,122 +1,125 @@
-const functions = require('firebase-functions');
-const admin = require('firebase-admin');
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
 
 /**
  * دالة معالجة طلبات السحب (تأكيد أو رفض)
- * اسم الدالة: processWithdrawalAction
+ * الوظيفة: إنهاء التعليق المالي إما بالخصم النهائي أو بإعادة الرصيد للمحفظة
  */
-exports.processWithdrawalAction = functions.https.onCall(async (data, context) => {
-    // 1. التحقق من الصلاحية
-    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول');
+export const processWithdrawalRequest = functions.https.onCall(async (data, context) => {
+    // 1. التحقق من المصادقة وصلاحية المسؤول/المندوب
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+    }
+
+    const adminUid = context.auth.uid;
+    const { requestId, action, reason, receiptUrl }: 
+    { requestId: string, action: 'APPROVE' | 'REJECT', reason?: string, receiptUrl?: string } = data;
     
-    const executorUid = context.auth.uid; // المندوب أو الأدمن المنفذ
-    const { requestId, action, receiptUrl, rejectReason } = data; // action: 'CONFIRM' or 'REJECT'
     const db = admin.database();
 
     try {
-        // 2. جلب بيانات الطلب من قاعدة البيانات
-        const requestSnap = await db.ref(`withdraw_requests/${requestId}`).once('value');
-        if (!requestSnap.exists()) throw new functions.https.HttpsError('not-found', 'الطلب غير موجود');
+        // 2. جلب البيانات والتحقق من الصلاحيات
+        const [adminSnap, requestSnap] = await Promise.all([
+            db.ref(`users/${adminUid}/profile/userType`).once('value'),
+            db.ref(`withdraw_requests/${requestId}`).once('value')
+        ]);
+
+        const userRole = adminSnap.val();
+        if (userRole !== 'ADMIN' && userRole !== 'DELEGATE') {
+            throw new functions.https.HttpsError('permission-denied', 'ليس لديك صلاحية معالجة هذا الطلب');
+        }
+
+        if (!requestSnap.exists()) {
+            throw new functions.https.HttpsError('not-found', 'طلب السحب غير موجود');
+        }
 
         const requestData = requestSnap.val();
+        if (requestData.status !== 'PENDING_MANUAL_TRANSFER') {
+            throw new functions.https.HttpsError('failed-precondition', 'هذا الطلب تمت معالجته مسبقاً');
+        }
+
         const userUid = requestData.senderUid;
         const totalAmount = requestData.amount + requestData.fee;
+        const updates: { [key: string]: any } = {};
+        const now = admin.database.ServerValue.TIMESTAMP;
 
-        // التحقق من أن الطلب لا يزال في حالة "انتظار التنفيذ اليدوي"
-        if (requestData.status !== "PENDING_MANUAL_TRANSFER") {
-            throw new functions.https.HttpsError('failed-precondition', 'تمت معالجة هذا الطلب مسبقاً');
-        }
-
-        const now = new Date();
-        const dayKey = now.toISOString().split('T')[0];
-        const monthKey = dayKey.substring(0, 7);
-        const updates = {};
-
-        // 3. معالجة الطلب بناءً على نوع الإجراء (Action)
+        // 3. منطق المعالجة بناءً على نوع الإجراء (Action)
         
-        if (action === 'CONFIRM') {
-            // --- حالة التأكيد (التنفيذ بنجاح) ---
-            
-            // التحقق من الإيصال للمحافظ وانستاباي
+        if (action === 'APPROVE') {
+            // --- مسار التأكيد (Approval Path) ---
             if (requestData.requiresReceipt && !receiptUrl) {
-                throw new functions.https.HttpsError('invalid-argument', 'يجب رفع صورة الإيصال لتأكيد التحويل');
+                throw new functions.https.HttpsError('invalid-argument', 'يجب إرفاق صورة الإيصال للتأكيد');
             }
 
-            // خصم المبلغ نهائياً من الحساب المعلق
+            // خصم نهائي من الرصيد المعلق
             updates[`users/${userUid}/wallets/egp_pending_balance`] = admin.database.ServerValue.increment(-totalAmount);
-
-            // تحديث بيانات الطلب
-            const finalData = {
-                ...requestData,
+            
+            // تحديث البيانات
+            const approvalDetails = {
                 status: "COMPLETED",
-                executedBy: executorUid,
+                completedBy: adminUid,
                 receiptUrl: receiptUrl || "N/A",
-                completedAt: admin.database.ServerValue.TIMESTAMP
+                processedAt: now
             };
-            updates[`withdraw_requests/${requestId}`] = finalData;
-            updates[`users/${userUid}/history/withdrawals/${requestId}`] = finalData;
-
-            // تحديث إحصائيات المندوب التراكمية
-            updates[`users/${executorUid}/stats/executed_withdrawals_count`] = admin.database.ServerValue.increment(1);
-            updates[`users/${executorUid}/stats/total_executed_amount`] = admin.database.ServerValue.increment(requestData.amount);
-
-            // إشعار المستخدم بالنجاح
-            await sendNotification(userUid, "تم التحويل بنجاح ✅", `تم تنفيذ طلبك بقيمة ${requestData.amount} ج.م.`);
+            Object.assign(updates, createUpdatePaths(requestId, userUid, requestData, approvalDetails));
 
         } else if (action === 'REJECT') {
-            // --- حالة الرفض والإرجاع ---
+            // --- مسار الرفض (Rejection Path) ---
+            if (!reason || reason.trim().length < 3) {
+                throw new functions.https.HttpsError('invalid-argument', 'يجب ذكر سبب الرفض');
+            }
 
-            // إعادة المبلغ والرسوم لرصيد المستخدم المتاح وخصمه من المعلق
-            updates[`users/${userUid}/wallets/egp_balance`] = admin.database.ServerValue.increment(totalAmount);
+            // إعادة المال: خصم من المعلق وإضافة للمتاح
             updates[`users/${userUid}/wallets/egp_pending_balance`] = admin.database.ServerValue.increment(-totalAmount);
+            updates[`users/${userUid}/wallets/egp_balance`] = admin.database.ServerValue.increment(totalAmount);
 
-            // تحديث بيانات الطلب إلى مرفوض
-            const rejectedData = {
-                ...requestData,
-                status: "REJECTED",
-                rejectedBy: executorUid,
-                reason: rejectReason || "لم يتم ذكر سبب",
-                rejectedAt: admin.database.ServerValue.TIMESTAMP
-            };
-            updates[`withdraw_requests/${requestId}`] = rejectedData;
-            updates[`users/${userUid}/history/withdrawals/${requestId}`] = rejectedData;
-
-            // عكس إيرادات الرسوم التراكمية (خصمها لأن العملية لم تتم)
+            // تصحيح الإيرادات (خصم الرسوم التي لن تُحصّل)
+            const dayKey = new Date(requestData.timestamp).toISOString().split('T')[0];
             updates[`stats/revenue/egp_fees/daily/${dayKey}`] = admin.database.ServerValue.increment(-requestData.fee);
-            updates[`stats/revenue/egp_fees/monthly/${monthKey}`] = admin.database.ServerValue.increment(-requestData.fee);
 
-            // إشعار المستخدم بالرفض
-            await sendNotification(userUid, "تم رفض طلب السحب ❌", `تم إرجاع المبلغ لحسابك. السبب: ${rejectReason}`);
+            const rejectionDetails = {
+                status: "REJECTED",
+                rejectedBy: adminUid,
+                rejectReason: reason,
+                processedAt: now
+            };
+            Object.assign(updates, createUpdatePaths(requestId, userUid, requestData, rejectionDetails));
 
         } else {
-            throw new functions.https.HttpsError('invalid-argument', 'إجراء غير مدعوم');
+            throw new functions.https.HttpsError('invalid-argument', 'إجراء غير صالح');
         }
 
-        // 4. تنفيذ جميع التحديثات مرة واحدة (Atomic Update)
+        // 4. تنفيذ التحديثات الذرية
         await db.ref().update(updates);
-        return { success: true, message: `تم تنفيذ الإجراء (${action}) بنجاح` };
 
-    } catch (e) {
-        throw new functions.https.HttpsError('internal', e.message);
+        // 5. إرسال الإشعار المناسب للمستخدم
+        const userTokenSnap = await db.ref(`users/${userUid}/fcmToken`).once('value');
+        if (userTokenSnap.exists()) {
+            const title = action === 'APPROVE' ? "تم تنفيذ سحبك ✅" : "تم رفض طلب السحب ❌";
+            const body = action === 'APPROVE' 
+                ? `وصلك مبلغ ${requestData.amount} ج.م. تفقد حسابك الآن.` 
+                : `تم رفض طلبك لسبب: ${reason}. وعاد الرصيد لمحفظتك.`;
+            
+            await admin.messaging().sendToDevice(userTokenSnap.val(), { notification: { title, body } });
+        }
+
+        return { success: true, action: action };
+
+    } catch (error: any) {
+        console.error("Process Withdrawal Error:", error);
+        if (error instanceof functions.https.HttpsError) throw error;
+        throw new functions.https.HttpsError('internal', error.message);
     }
 });
 
 /**
- * دالة مساعدة لإرسال الإشعارات
+ * دالة مساعدة لتوليد مسارات التحديث المتكررة
  */
-async function sendNotification(uid, title, body) {
-    const userTokenSnap = await admin.database().ref(`users/${uid}/fcmToken`).once('value');
-    if (userTokenSnap.exists()) {
-        await admin.messaging().sendToDevice(userTokenSnap.val(), {
-            notification: { title, body }
-        });
-    }
+function createUpdatePaths(reqId: string, uId: string, oldData: any, details: any) {
+    const finalObj = { ...oldData, ...details };
+    return {
+        [`withdraw_requests/${reqId}`]: finalObj,
+        [`users/${uId}/history/withdrawals/${reqId}`]: finalObj,
+        [`stats/logs/all_withdrawals/${reqId}`]: finalObj
+    };
 }
-
-//الذكاء في الإيرادات: في حالة التأكيد، تبقى الرسوم المسجلة مسبقاً كما هي. أما في حالة الرفض، تقوم الدالة تلقائياً بخصم (عكس) قيمة الرسوم من السجلات التراكمية اليومية والشهرية لضمان دقة أرباح المنصة.
-
-إدارة الرصيد المعلق: في كلتا الحالتين (تأكيد أو رفض)، يتم تصفير المبلغ من محفظة egp_pending_balance للمستخدم، إما بالخصم النهائي أو بالإرجاع للمحفظة الأساسية.
-
-توثيق كامل: تسجل الدالة من قام بالإجراء (executedBy أو rejectedBy) وتُحدث إحصائيات المندوب فقط في حالة التنفيذ الناجح.
-
-أمان الإيصال: لا تزال القاعدة الصارمة موجودة؛ لا يمكن "التأكيد" لعمليات المحافظ وانستاباي بدون رابط receiptUrl.
